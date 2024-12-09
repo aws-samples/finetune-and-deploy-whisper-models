@@ -1,0 +1,23 @@
+FROM nvcr.io/nvidia/tritonserver:24.10-py3
+
+RUN apt update && apt-get install -y ffmpeg
+
+
+WORKDIR /workspace
+COPY requirements.txt /workspace/requirements.txt
+COPY serve /workspace/serve
+# COPY export_model.sh /workspace/export_model.sh
+# COPY model_repo_whisper_trtllm /workspace/model_repo_whisper_trtllm 
+
+RUN pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com tensorrt-llm==0.15.0.dev2024110500 && \
+pip install tritonclient[all] && \
+pip install -r requirements.txt && \
+chmod +x /workspace/serve
+
+
+# 定义环境变量
+ENV PATH="/workspace:${PATH}"
+
+# 运行serve
+ENTRYPOINT []
+CMD ["serve"]

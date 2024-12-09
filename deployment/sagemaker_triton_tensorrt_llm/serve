@@ -1,0 +1,55 @@
+#!/bin/bash
+
+set -e  # Exit immediately if a command exits with a non-zero status.
+
+# Set the directory to check
+base_dir="/opt/ml/model/"
+export SAGEMAKER_BIND_TO_PORT=${SAGEMAKER_BIND_TO_PORT:-8080}
+
+# Check if the directory exists
+if [ ! -d "$base_dir" ]; then
+    echo "Error: $base_dir directory does not exist"
+    exit 1
+fi
+
+# Find the first subdirectory in the base directory
+model_dir=$(find "$base_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)
+
+# Check if a subdirectory was found
+if [ -z "$model_dir" ]; then
+    echo "No subdirectory found"
+    exit 0
+else
+    # Set the model_path
+    model_path="$model_dir"
+    
+    echo "Found model directory" $model_dir
+
+    if [ -f "$model_dir/start_triton_and_client.sh" ]; then
+        # If triton_client.py file exists, proceed with setup
+        cp -r $base_dir/model_data/* /workspace/ || { log "Failed to copy model data"; exit 1; }
+        echo "Copied ${model_dir} files to workspace"
+
+        echo "Contents of /workspace:"
+        ls -R /workspace
+
+        python3 ssh_helper_start.py || { echo "SSH helper start failed";}
+        
+        # Start Triton server and run client
+        chmod +x /workspace/start_triton_and_client.sh
+        /workspace/start_triton_and_client.sh
+    else
+        echo "Error: start_triton_and_client.sh not found in $model_dir"
+        exit 1
+    fi
+
+fi
+
+# Cleanup function
+cleanup() {
+    if [ ! -z "$triton_pid" ]; then
+        kill $triton_pid
+    fi
+}
+
+trap cleanup EXIT

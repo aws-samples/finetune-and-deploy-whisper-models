@@ -1,0 +1,52 @@
+name: "whisper"
+backend: "python"
+max_batch_size: 48 
+
+parameters [
+  {
+   key: "n_mels", 
+   value: {string_value:"128"} # 128 dim for large-v3, 80 dim for large-v2
+  },
+  {
+    key: "engine_dir"
+    value: { string_value: "./model_repo_whisper_trtllm/whisper/1/whisper_large_v3"}
+  }
+]
+
+
+input [
+  {
+    name: "TEXT_PREFIX"
+    data_type: TYPE_STRING
+    dims: [1]
+  },
+  {
+    name: "WAV"
+    data_type: TYPE_FP32
+    dims: [-1]
+  },
+  {
+    name: "REPETITION_PENALTY"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  }
+]
+
+output [
+  {
+    name: "TRANSCRIPTS"
+    data_type: TYPE_STRING
+    dims: [1]
+  }
+]
+
+dynamic_batching {
+    max_queue_delay_microseconds: 5000
+  }
+instance_group [
+    {
+      count: 1
+      kind: KIND_CPU
+    }
+  ]

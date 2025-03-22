@@ -1,7 +1,7 @@
 tiktoken
 pynvml~=11.5.0
 sagemaker-ssh-helper==2.2.0
-sagemaker==2.232.1
+sagemaker==2.237.3
 boto3==1.35.24
 datasets
 kaldialign

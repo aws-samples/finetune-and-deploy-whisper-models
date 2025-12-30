@@ -6,6 +6,23 @@ This directory contains the successful deployment configuration for Whisper Trit
 
 Before deployment, ensure the following components are installed and configured:
 
+### 0. Image Build and Model Compilation (Required First)
+
+**Important**: Before deploying to HyperPod EKS, you must first build the Docker image and compile the model. Please follow the instructions in the parent directory:
+
+📖 **Reference**: [../README.md](../README.md)
+
+Key steps:
+1. Configure `../config.sh` with your parameters
+2. Run `../prepare_and_deploy.sh` to:
+   - Build and push Docker image to ECR
+   - Compile model with TensorRT-LLM
+   - Upload compiled model to S3
+
+⚠️ **Note**: Models compiled with TensorRT-LLM can only be deployed on the same instance type used for compilation. For example:
+- Model compiled on G5 instance → Deploy on G5 nodes
+- Model compiled on G6E instance → Deploy on G6E nodes
+
 ### 1. AWS Load Balancer Controller
 Check if AWS Load Balancer Controller is installed:
 ```bash

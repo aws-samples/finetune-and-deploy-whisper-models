@@ -1,0 +1,41 @@
+global:
+  scrape_interval: 30s
+  external_labels:
+    cluster: eks-cluster-hypd-test-whisper
+
+scrape_configs:
+  # Triton metrics from pods with prometheus annotations
+  - job_name: triton-metrics
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      # Only scrape pods with prometheus.io/scrape annotation
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      # Use the prometheus.io/path annotation for metrics path
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      # Use the prometheus.io/port annotation to set the scrape port
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      # Map pod labels to metric labels
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      # Add namespace label
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: namespace
+      # Add pod name label
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod
+      # Add node name label
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        action: replace
+        target_label: node

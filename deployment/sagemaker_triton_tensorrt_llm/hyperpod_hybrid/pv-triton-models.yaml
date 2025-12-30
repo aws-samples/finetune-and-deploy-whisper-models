@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${PV_NAME}  # pv-triton-models
+spec:
+  accessModes:
+  - ReadWriteMany
+  capacity:
+    storage: ${STORAGE_SIZE}  # 1200Gi
+  csi:
+    driver: s3.csi.aws.com
+    volumeAttributes:
+      bucketName: ${S3_BUCKET_NAME}  # triton-models-xq
+      mount-timeout-seconds: "300"
+    volumeHandle: s3-csi-driver-volume-triton-models
+  mountOptions:
+  - allow-delete
+  - region ${AWS_REGION}  # us-east-1
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem

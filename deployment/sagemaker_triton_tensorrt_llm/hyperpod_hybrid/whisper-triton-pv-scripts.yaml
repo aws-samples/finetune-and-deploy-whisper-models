@@ -1,0 +1,184 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whisper-triton-g6e
+  labels:
+    app: whisper-triton-g6e
+    service: whisper-triton
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whisper-triton-g6e
+  template:
+    metadata:
+      labels:
+        app: whisper-triton-g6e
+        service: whisper-triton
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10087"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: ${G6E_INSTANCE_TYPE}  # ml.g6e.2xlarge
+      containers:
+      - name: whisper-triton
+        image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY_NAME}:${ECR_IMAGE_TAG}  # 596899493901.dkr.ecr.us-east-2.amazonaws.com/sagemaker-endpoint/whisper-triton-byoc-g6e:latest
+        ports:
+        - containerPort: ${TRITON_PORT}  # 10086
+        - containerPort: ${API_PORT}  # 8080
+        - containerPort: ${METRICS_PORT}  # 10087
+          name: metrics
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            cd /workspace
+            echo "Starting Triton server..."
+            model_repo_path=/workspace/model_repo_whisper_trtllm
+            tritonserver --model-repository $model_repo_path \
+              --pinned-memory-pool-byte-size=2048000000 \
+              --cuda-memory-pool-byte-size=0:4096000000 \
+              --http-port 10086 \
+              --metrics-port 10087 > /tmp/triton.log 2>&1 &
+            triton_pid=$!
+            
+            echo "Waiting for Triton server to be ready..."
+            timeout=120
+            while [ $timeout -gt 0 ]; do
+              if curl -s http://127.0.0.1:10086/v2/health/ready > /dev/null 2>&1; then
+                echo "Triton server is ready!"
+                break
+              fi
+              sleep 2
+              ((timeout--))
+            done
+            
+            if [ $timeout -eq 0 ]; then
+              echo "Triton server failed to start within 240 seconds"
+              cat /tmp/triton.log
+              exit 1
+            fi
+            
+            echo "Starting API server..."
+            python3 /workspace/deployment_codes/run_server.py -w 32
+        volumeMounts:
+        - name: triton-models-scripts
+          mountPath: /workspace/model_repo_whisper_trtllm
+          subPath: ${S3_G6E_MODEL_PATH}  # test_turbo_g6e
+        - name: triton-models-scripts
+          mountPath: /workspace/deployment_codes
+          subPath: ${S3_SCRIPTS_PATH}  # deployment_codes 
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+          limits:
+            nvidia.com/gpu: 1
+      volumes:
+      - name: triton-models-scripts
+        persistentVolumeClaim:
+          claimName: triton-models
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whisper-triton-g5
+  labels:
+    app: whisper-triton-g5
+    service: whisper-triton
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whisper-triton-g5
+  template:
+    metadata:
+      labels:
+        app: whisper-triton-g5
+        service: whisper-triton
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "10087"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: ${G5_INSTANCE_TYPE}  # ml.g5.2xlarge
+      containers:
+      - name: whisper-triton
+        image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY_NAME}:${ECR_IMAGE_TAG}  # 596899493901.dkr.ecr.us-east-2.amazonaws.com/sagemaker-endpoint/whisper-triton-byoc-g6e:latest
+        ports:
+        - containerPort: ${TRITON_PORT}  # 10086
+        - containerPort: ${API_PORT}  # 8080
+        - containerPort: ${METRICS_PORT}  # 10087
+          name: metrics
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            cd /workspace
+            echo "Starting Triton server..."
+            model_repo_path=/workspace/model_repo_whisper_trtllm
+            tritonserver --model-repository $model_repo_path \
+              --pinned-memory-pool-byte-size=2048000000 \
+              --cuda-memory-pool-byte-size=0:4096000000 \
+              --http-port 10086 \
+              --metrics-port 10087 > /tmp/triton.log 2>&1 &
+            triton_pid=$!
+            
+            echo "Waiting for Triton server to be ready..."
+            timeout=120
+            while [ $timeout -gt 0 ]; do
+              if curl -s http://127.0.0.1:10086/v2/health/ready > /dev/null 2>&1; then
+                echo "Triton server is ready!"
+                break
+              fi
+              sleep 2
+              ((timeout--))
+            done
+            
+            if [ $timeout -eq 0 ]; then
+              echo "Triton server failed to start within 240 seconds"
+              cat /tmp/triton.log
+              exit 1
+            fi
+            
+            echo "Starting API server..."
+            python3 /workspace/deployment_codes/run_server.py -w 32
+        volumeMounts:
+        - name: triton-models-scripts
+          mountPath: /workspace/model_repo_whisper_trtllm
+          subPath: ${S3_G5_MODEL_PATH}  # test_turbo
+        - name: triton-models-scripts
+          mountPath: /workspace/deployment_codes
+          subPath: ${S3_SCRIPTS_PATH}  # deployment_codes 
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+          limits:
+            nvidia.com/gpu: 1
+      volumes:
+      - name: triton-models-scripts
+        persistentVolumeClaim:
+          claimName: ${PVC_NAME}  # triton-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${SERVICE_NAME}  # whisper-triton-unified-nlb
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  ports:
+    - name: http
+      port: ${API_PORT}  # 8080
+      protocol: TCP
+      targetPort: ${API_PORT}  # 8080
+    - name: triton
+      port: ${TRITON_PORT}  # 10086
+      protocol: TCP
+      targetPort: ${TRITON_PORT}  # 10086
+  selector:
+    service: whisper-triton
+  type: LoadBalancer

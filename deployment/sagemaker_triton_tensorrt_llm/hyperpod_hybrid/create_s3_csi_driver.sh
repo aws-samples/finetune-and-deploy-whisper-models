@@ -541,25 +541,103 @@ EOF
     fi
 }
 
+# 检查是否通过 EKS Addon 安装了 S3 CSI Driver
+check_eks_addon() {
+    local addon_status
+    addon_status=$(aws eks describe-addon \
+        --cluster-name "${CLUSTER_NAME}" \
+        --addon-name aws-mountpoint-s3-csi-driver \
+        --region "${REGION}" \
+        --query 'addon.status' \
+        --output text 2>/dev/null || echo "NOT_FOUND")
+    echo "$addon_status"
+}
+
 # 安装 S3 CSI Driver
 install_s3_csi_driver() {
     log_step "检查并安装 S3 CSI Driver..."
-    
-    # 检查是否已安装 CSI Driver
-    if kubectl get deployment s3-csi-controller -n kube-system &>/dev/null && \
-       kubectl get daemonset s3-csi-node -n kube-system &>/dev/null; then
+
+    # 检查是否已通过 EKS Addon 安装
+    local addon_status
+    addon_status=$(check_eks_addon)
+
+    if [[ "$addon_status" != "NOT_FOUND" ]]; then
+        log_info "✓ S3 CSI Driver 已通过 EKS Addon 安装 (状态: ${addon_status})"
+
+        if [[ "$addon_status" == "ACTIVE" ]]; then
+            log_info "EKS Addon 运行正常，跳过安装步骤"
+
+            # 更新 Addon 的 ServiceAccount 配置
+            log_info "更新 EKS Addon ServiceAccount 配置..."
+            aws eks update-addon \
+                --cluster-name "${CLUSTER_NAME}" \
+                --addon-name aws-mountpoint-s3-csi-driver \
+                --service-account-role-arn "${ROLE_ARN}" \
+                --region "${REGION}" 2>/dev/null || log_warn "Addon ServiceAccount 更新失败，可能需要手动配置"
+
+            # 显示组件状态
+            if kubectl get daemonset s3-csi-node -n kube-system &>/dev/null; then
+                NODE_READY=$(kubectl get daemonset s3-csi-node -n kube-system -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
+                NODE_DESIRED=$(kubectl get daemonset s3-csi-node -n kube-system -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
+                log_info "  Node DaemonSet: ${NODE_READY}/${NODE_DESIRED} Ready"
+            fi
+            if kubectl get deployment s3-csi-controller -n kube-system &>/dev/null; then
+                CONTROLLER_READY=$(kubectl get deployment s3-csi-controller -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+                CONTROLLER_DESIRED=$(kubectl get deployment s3-csi-controller -n kube-system -o jsonpath='{.status.replicas}' 2>/dev/null || echo "0")
+                log_info "  Controller: ${CONTROLLER_READY}/${CONTROLLER_DESIRED} Ready"
+            fi
+            return 0
+        else
+            log_warn "EKS Addon 状态异常: ${addon_status}"
+            log_info "尝试删除并重新通过 EKS Addon 安装..."
+            aws eks delete-addon \
+                --cluster-name "${CLUSTER_NAME}" \
+                --addon-name aws-mountpoint-s3-csi-driver \
+                --region "${REGION}" 2>/dev/null || true
+            log_info "等待 Addon 删除完成..."
+            sleep 30
+        fi
+    fi
+
+    # 检查是否存在由 EKS 管理但非 Addon API 注册的残留资源
+    if kubectl get daemonset s3-csi-node -n kube-system &>/dev/null; then
+        local managed_by
+        managed_by=$(kubectl get daemonset s3-csi-node -n kube-system -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || echo "")
+        if [[ "$managed_by" == "EKS" ]]; then
+            log_warn "检测到 EKS 管理的 S3 CSI Driver 资源（非 Addon API），尝试通过 EKS Addon API 安装..."
+            if aws eks create-addon \
+                --cluster-name "${CLUSTER_NAME}" \
+                --addon-name aws-mountpoint-s3-csi-driver \
+                --service-account-role-arn "${ROLE_ARN}" \
+                --region "${REGION}" \
+                --resolve-conflicts OVERWRITE 2>/dev/null; then
+                log_info "✓ EKS Addon 创建成功，等待就绪..."
+                wait_for_addon_ready
+                return $?
+            else
+                log_warn "EKS Addon API 安装失败，将直接使用已有资源"
+                log_info "更新 DaemonSet ServiceAccount..."
+                kubectl patch daemonset s3-csi-node -n kube-system \
+                    -p '{"spec":{"template":{"spec":{"serviceAccountName":"s3-csi-driver-sa"}}}}' 2>/dev/null || true
+                return 0
+            fi
+        fi
+    fi
+
+    # 检查是否已安装且健康（非 EKS 管理）
+    if kubectl get daemonset s3-csi-node -n kube-system &>/dev/null; then
         log_info "✓ S3 CSI Driver 已安装"
-        
-        # 检查组件健康状态
-        CONTROLLER_READY=$(kubectl get deployment s3-csi-controller -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-        CONTROLLER_DESIRED=$(kubectl get deployment s3-csi-controller -n kube-system -o jsonpath='{.status.replicas}' 2>/dev/null || echo "0")
         NODE_READY=$(kubectl get daemonset s3-csi-node -n kube-system -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
         NODE_DESIRED=$(kubectl get daemonset s3-csi-node -n kube-system -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
-        
-        log_info "  Controller: ${CONTROLLER_READY}/${CONTROLLER_DESIRED} Ready"
         log_info "  Node: ${NODE_READY}/${NODE_DESIRED} Ready"
-        
-        if [[ "$CONTROLLER_READY" == "$CONTROLLER_DESIRED" ]] && [[ "$NODE_READY" == "$NODE_DESIRED" ]] && [[ "$CONTROLLER_READY" != "0" ]]; then
+
+        if kubectl get deployment s3-csi-controller -n kube-system &>/dev/null; then
+            CONTROLLER_READY=$(kubectl get deployment s3-csi-controller -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            CONTROLLER_DESIRED=$(kubectl get deployment s3-csi-controller -n kube-system -o jsonpath='{.status.replicas}' 2>/dev/null || echo "0")
+            log_info "  Controller: ${CONTROLLER_READY}/${CONTROLLER_DESIRED} Ready"
+        fi
+
+        if [[ "$NODE_READY" -gt 0 ]]; then
             log_info "✓ S3 CSI Driver 运行正常"
             return 0
         else
@@ -568,17 +646,30 @@ install_s3_csi_driver() {
     else
         log_info "S3 CSI Driver 未安装，开始安装..."
     fi
-    
-    # 方式1: 使用 Helm 安装（推荐）
+
+    # 优先尝试 EKS Addon 方式安装
+    log_info "尝试通过 EKS Addon 安装 S3 CSI Driver..."
+    if aws eks create-addon \
+        --cluster-name "${CLUSTER_NAME}" \
+        --addon-name aws-mountpoint-s3-csi-driver \
+        --service-account-role-arn "${ROLE_ARN}" \
+        --region "${REGION}" \
+        --resolve-conflicts OVERWRITE 2>/dev/null; then
+        log_info "✓ EKS Addon 创建成功，等待就绪..."
+        wait_for_addon_ready
+        return $?
+    else
+        log_warn "EKS Addon 安装失败，回退到 Helm 安装..."
+    fi
+
+    # 回退: 使用 Helm 安装
     if command -v helm &> /dev/null; then
         log_info "使用 Helm 安装 S3 CSI Driver..."
-        
-        # 添加 AWS EKS chart repository
+
         log_info "添加 Helm repository..."
         helm repo add aws-mountpoint-s3-csi-driver https://awslabs.github.io/mountpoint-s3-csi-driver 2>/dev/null || true
         helm repo update
-        
-        # 安装或升级 S3 CSI Driver
+
         log_info "安装 S3 CSI Driver..."
         if helm upgrade --install aws-mountpoint-s3-csi-driver \
             aws-mountpoint-s3-csi-driver/aws-mountpoint-s3-csi-driver \
@@ -592,38 +683,67 @@ install_s3_csi_driver() {
             return $?
         fi
     else
-        # 方式2: 使用 kubectl 安装
         log_warn "未检测到 Helm，使用 kubectl 安装 S3 CSI Driver..."
         install_s3_csi_driver_kubectl
         return $?
     fi
-    
-    # 等待组件就绪
+
+    wait_for_driver_ready
+}
+
+# 等待 EKS Addon 就绪
+wait_for_addon_ready() {
+    local max_attempts=30
+    local attempt=0
+
+    while [[ $attempt -lt $max_attempts ]]; do
+        local status
+        status=$(check_eks_addon)
+
+        if [[ "$status" == "ACTIVE" ]]; then
+            log_info "✓ EKS Addon 已就绪 (ACTIVE)"
+            return 0
+        elif [[ "$status" == "CREATE_FAILED" || "$status" == "DEGRADED" ]]; then
+            log_error "EKS Addon 状态异常: ${status}"
+            log_info "请检查: aws eks describe-addon --cluster-name ${CLUSTER_NAME} --addon-name aws-mountpoint-s3-csi-driver --region ${REGION}"
+            return 1
+        fi
+
+        log_info "等待 EKS Addon 就绪... (${attempt}/${max_attempts}) 当前状态: ${status}"
+        sleep 10
+        ((attempt++))
+    done
+
+    log_error "EKS Addon 就绪超时"
+    return 1
+}
+
+# 等待 Driver 组件就绪
+wait_for_driver_ready() {
     log_info "等待 S3 CSI Driver 组件就绪..."
     local max_attempts=30
     local attempt=0
-    
+
     while [[ $attempt -lt $max_attempts ]]; do
-        CONTROLLER_READY=$(kubectl get deployment s3-csi-controller -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
         NODE_READY=$(kubectl get daemonset s3-csi-node -n kube-system -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
-        
-        if [[ "$CONTROLLER_READY" -gt 0 ]] && [[ "$NODE_READY" -gt 0 ]]; then
+
+        if [[ "$NODE_READY" -gt 0 ]]; then
             log_info "✓ S3 CSI Driver 组件已就绪"
             echo ""
-            kubectl get deployment s3-csi-controller -n kube-system
             kubectl get daemonset s3-csi-node -n kube-system
+            kubectl get deployment s3-csi-controller -n kube-system 2>/dev/null || true
             return 0
         fi
-        
+
         log_info "等待组件就绪... (${attempt}/${max_attempts})"
         sleep 10
         ((attempt++))
     done
-    
+
     log_error "S3 CSI Driver 安装超时"
     log_info "请手动检查组件状态："
-    echo "  kubectl get deployment s3-csi-controller -n kube-system"
     echo "  kubectl get daemonset s3-csi-node -n kube-system"
+    echo "  kubectl get deployment s3-csi-controller -n kube-system"
     echo "  kubectl logs -n kube-system -l app.kubernetes.io/name=aws-mountpoint-s3-csi-driver"
     return 1
 }
@@ -631,32 +751,38 @@ install_s3_csi_driver() {
 # 使用 kubectl 安装 S3 CSI Driver
 install_s3_csi_driver_kubectl() {
     log_info "使用 kubectl 安装 S3 CSI Driver..."
-    
-    # 获取最新版本
+
     local CSI_VERSION="v1.10.0"
-    local MANIFEST_URL="https://raw.githubusercontent.com/awslabs/mountpoint-s3-csi-driver/main/deploy/kubernetes/overlays/stable/public-ecr/kustomization.yaml"
-    
-    log_info "下载并应用 S3 CSI Driver manifest (版本: ${CSI_VERSION})..."
-    
-    # 创建临时目录
+    local BASE_URL="https://raw.githubusercontent.com/awslabs/mountpoint-s3-csi-driver/${CSI_VERSION}/deploy/kubernetes/base"
+
+    log_info "下载 S3 CSI Driver manifest (版本: ${CSI_VERSION})..."
+
     local TEMP_DIR="/tmp/s3-csi-driver-$$"
     mkdir -p "${TEMP_DIR}"
-    
-    # 下载 manifest 文件
-    if ! curl -sSL "https://raw.githubusercontent.com/awslabs/mountpoint-s3-csi-driver/${CSI_VERSION}/deploy/kubernetes/base/kustomization.yaml" -o "${TEMP_DIR}/kustomization.yaml"; then
-        log_error "下载 S3 CSI Driver manifest 失败"
+
+    local FILES=("kustomization.yaml" "csidriver.yaml" "node.yaml" "node-windows.yaml" "controller.yaml" "clusterrole.yaml" "clusterrolebinding.yaml")
+    local download_ok=true
+
+    for f in "${FILES[@]}"; do
+        if ! curl -sSL --fail "${BASE_URL}/${f}" -o "${TEMP_DIR}/${f}" 2>/dev/null; then
+            log_warn "下载 ${f} 失败（可能不存在），跳过"
+            rm -f "${TEMP_DIR}/${f}"
+        fi
+    done
+
+    if [[ ! -f "${TEMP_DIR}/kustomization.yaml" ]]; then
+        log_error "下载 kustomization.yaml 失败"
         rm -rf "${TEMP_DIR}"
         return 1
     fi
-    
-    # 应用 manifest
+
     if kubectl apply -k "${TEMP_DIR}"; then
         log_info "✓ S3 CSI Driver manifest 应用成功"
-        
-        # 更新 DaemonSet 使用我们创建的 ServiceAccount
+
         log_info "更新 DaemonSet ServiceAccount..."
-        kubectl patch daemonset s3-csi-node -n kube-system -p '{"spec":{"template":{"spec":{"serviceAccountName":"s3-csi-driver-sa"}}}}' 2>/dev/null || true
-        
+        kubectl patch daemonset s3-csi-node -n kube-system \
+            -p '{"spec":{"template":{"spec":{"serviceAccountName":"s3-csi-driver-sa"}}}}' 2>/dev/null || true
+
         rm -rf "${TEMP_DIR}"
         return 0
     else

@@ -250,24 +250,24 @@ echo ""
 
 # 检测集群类型（EKS 或 HyperPod）
 detect_cluster_type() {
-    echo "检测集群类型..."
+    echo "检测集群类型..." >&2
     
     # 尝试通过 EKS API 查询
     if aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
-        echo -e "${GREEN}✓${NC} 检测到标准 EKS 集群"
+        echo -e "${GREEN}✓${NC} 检测到标准 EKS 集群" >&2
         echo "STANDARD_EKS"
         return 0
     else
         # 检查是否是 HyperPod（从 context 判断）
         CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "")
         if echo "$CURRENT_CONTEXT" | grep -q "sagemaker"; then
-            echo -e "${YELLOW}!${NC} 检测到 SageMaker HyperPod 集群"
-            echo -e "${BLUE}ℹ${NC}  HyperPod 集群不会出现在 EKS API 中"
+            echo -e "${YELLOW}!${NC} 检测到 SageMaker HyperPod 集群" >&2
+            echo -e "${BLUE}ℹ${NC}  HyperPod 集群不会出现在 EKS API 中" >&2
             echo "HYPERPOD"
             return 0
         else
-            echo -e "${YELLOW}!${NC} 无法通过 EKS API 查询集群"
-            echo -e "${BLUE}ℹ${NC}  将按 HyperPod 模式处理"
+            echo -e "${YELLOW}!${NC} 无法通过 EKS API 查询集群" >&2
+            echo -e "${BLUE}ℹ${NC}  将按 HyperPod 模式处理" >&2
             echo "HYPERPOD"
             return 0
         fi
@@ -386,30 +386,89 @@ if [ "$INSTALL_CONTROLLER" = true ]; then
     echo "步骤 3.5: 创建 IAM Role 和 ServiceAccount..."
     
     if [ "$USE_EKSCTL" = true ]; then
-        # 标准 EKS - 使用 eksctl
-        echo "使用 eksctl 创建 ServiceAccount..."
-        
-        if kubectl get sa aws-load-balancer-controller -n kube-system >/dev/null 2>&1; then
-            echo -e "${YELLOW}!${NC} ServiceAccount 已存在，将重新创建..."
-            eksctl delete iamserviceaccount \
+        # 标准 EKS
+        LB_ROLE_NAME="AmazonEKSLoadBalancerControllerRole"
+        ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${LB_ROLE_NAME}"
+
+        if aws iam get-role --role-name "$LB_ROLE_NAME" >/dev/null 2>&1; then
+            echo -e "${YELLOW}!${NC} IAM Role '${LB_ROLE_NAME}' 已存在（可能由其他集群创建）"
+            echo "    将复用已有 Role 并更新信任策略..."
+
+            OIDC_URL=$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" \
+                --query 'cluster.identity.oidc.issuer' --output text)
+            OIDC_ID=$(echo "$OIDC_URL" | awk -F'/' '{print $NF}')
+
+            if [ -z "$OIDC_ID" ]; then
+                echo -e "${RED}✗${NC} 无法获取当前集群的 OIDC Provider ID"
+                exit 1
+            fi
+            echo -e "${GREEN}✓${NC} 当前集群 OIDC ID: $OIDC_ID"
+
+            cat > trust-policy-lb-update.json << EOFTP
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::${ACCOUNT_ID}:oidc-provider/oidc.eks.${AWS_REGION}.amazonaws.com/id/${OIDC_ID}"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.${AWS_REGION}.amazonaws.com/id/${OIDC_ID}:sub": "system:serviceaccount:kube-system:aws-load-balancer-controller",
+          "oidc.eks.${AWS_REGION}.amazonaws.com/id/${OIDC_ID}:aud": "sts.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+EOFTP
+            aws iam update-assume-role-policy \
+                --role-name "$LB_ROLE_NAME" \
+                --policy-document file://trust-policy-lb-update.json
+            echo -e "${GREEN}✓${NC} 已更新 Role 信任策略为当前集群的 OIDC Provider"
+            rm -f trust-policy-lb-update.json
+
+            aws iam attach-role-policy \
+                --role-name "$LB_ROLE_NAME" \
+                --policy-arn "$POLICY_ARN" 2>/dev/null || true
+
+            cat > sa-lb-controller.yaml << EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aws-load-balancer-controller
+  namespace: kube-system
+  annotations:
+    eks.amazonaws.com/role-arn: ${ROLE_ARN}
+EOF
+            kubectl apply -f sa-lb-controller.yaml
+            rm -f sa-lb-controller.yaml
+            echo -e "${GREEN}✓${NC} 已复用已有 Role 并创建 ServiceAccount"
+        else
+            echo "使用 eksctl 创建 ServiceAccount..."
+
+            if kubectl get sa aws-load-balancer-controller -n kube-system >/dev/null 2>&1; then
+                echo -e "${YELLOW}!${NC} ServiceAccount 已存在，将重新创建..."
+                eksctl delete iamserviceaccount \
+                    --cluster="$CLUSTER_NAME" \
+                    --region="$AWS_REGION" \
+                    --namespace=kube-system \
+                    --name=aws-load-balancer-controller \
+                    --wait || true
+            fi
+
+            eksctl create iamserviceaccount \
                 --cluster="$CLUSTER_NAME" \
                 --region="$AWS_REGION" \
                 --namespace=kube-system \
                 --name=aws-load-balancer-controller \
-                --wait || true
+                --role-name "$LB_ROLE_NAME" \
+                --attach-policy-arn="$POLICY_ARN" \
+                --approve \
+                --override-existing-serviceaccounts
         fi
-        
-        eksctl create iamserviceaccount \
-            --cluster="$CLUSTER_NAME" \
-            --region="$AWS_REGION" \
-            --namespace=kube-system \
-            --name=aws-load-balancer-controller \
-            --role-name AmazonEKSLoadBalancerControllerRole \
-            --attach-policy-arn="$POLICY_ARN" \
-            --approve \
-            --override-existing-serviceaccounts
-        
-        ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/AmazonEKSLoadBalancerControllerRole"
     else
         # HyperPod - 手动创建
         echo "手动创建 IAM Role 和 ServiceAccount..."
@@ -488,10 +547,29 @@ EOF
     echo "Role ARN: $ROLE_ARN"
     echo ""
     
+    # 修复已有的 IngressClass 所有权（EKS 可能预创建了 IngressClass "alb"，需要让 Helm 接管）
+    echo "步骤 3.6: 检查并修复 IngressClass 所有权..."
+    if kubectl get ingressclass alb >/dev/null 2>&1; then
+        CURRENT_MANAGED_BY=$(kubectl get ingressclass alb -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}' 2>/dev/null || echo "")
+        if [ "$CURRENT_MANAGED_BY" != "Helm" ]; then
+            echo -e "${YELLOW}!${NC} 发现已有的 IngressClass \"alb\" (managed-by: ${CURRENT_MANAGED_BY:-未设置})"
+            echo "    正在将所有权转移给 Helm..."
+            kubectl label ingressclass alb app.kubernetes.io/managed-by=Helm --overwrite
+            kubectl annotate ingressclass alb meta.helm.sh/release-name=aws-load-balancer-controller --overwrite
+            kubectl annotate ingressclass alb meta.helm.sh/release-namespace=kube-system --overwrite
+            echo -e "${GREEN}✓${NC} IngressClass 所有权已转移给 Helm"
+        else
+            echo -e "${GREEN}✓${NC} IngressClass \"alb\" 已由 Helm 管理，无需修复"
+        fi
+    else
+        echo -e "${BLUE}ℹ${NC}  IngressClass \"alb\" 不存在，将由 Helm 自动创建"
+    fi
+    echo ""
+
     # 安装 Controller
-    echo "步骤 3.6: 安装 AWS Load Balancer Controller..."
-    helm repo add eks https://aws.github.io/eks-charts >/dev/null 2>&1 || true
-    helm repo update >/dev/null 2>&1
+    echo "步骤 3.7: 安装 AWS Load Balancer Controller..."
+    # helm repo add eks https://aws.github.io/eks-charts >/dev/null 2>&1 || true
+    # helm repo update >/dev/null 2>&1
     
     helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
         -n kube-system \
@@ -505,7 +583,7 @@ EOF
     echo ""
     
     # 等待 Controller 启动
-    echo "步骤 3.7: 等待 Controller 启动..."
+    echo "步骤 3.8: 等待 Controller 启动..."
     kubectl wait --for=condition=available --timeout=180s \
         deployment/aws-load-balancer-controller -n kube-system
     
@@ -715,12 +793,12 @@ echo ""
 # 检查 Controller 日志
 echo "步骤 4.1: 检查 Load Balancer Controller 状态..."
 echo "Controller Pods 状态:"
-kubectl get pods -n kube-system -l app.kubernetes.io/name=alb -o wide
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller -o wide
 echo ""
 
 echo "最近的 Controller 日志 (检查是否还有权限错误):"
 echo "----------------------------------------"
-kubectl logs -n kube-system deployment/hyperpod-inference-operator-alb --tail=10 --prefix=true
+kubectl logs -n kube-system deployment/aws-load-balancer-controller --tail=10 --prefix=true
 echo "----------------------------------------"
 echo ""
 
